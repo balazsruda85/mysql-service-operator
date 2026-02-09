@@ -1,0 +1,261 @@
+---
+#######################################
+# 0. Flags
+#######################################
+- name: Set enabledMetrics flag (default false)
+  ansible.builtin.set_fact:
+    enabled_metrics: "{{ (ansible_operator_meta.spec.enabledMetrics | default(false)) | bool }}"
+
+#######################################
+# 1. Check if MySQL Secret already exists
+#######################################
+- name: Check if MySQL auth secret already exists
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "mysql-secret-{{ ansible_operator_meta.name }}"
+    namespace: "{{ ansible_operator_meta.namespace }}"
+  register: mysql_secret
+
+#######################################
+# 2. Generate root password if needed
+#######################################
+- name: Generate MySQL root password
+  ansible.builtin.shell: "openssl rand -base64 24"
+  register: generated_mysql_password
+  changed_when: true
+  when: mysql_secret.resources | length == 0
+
+#######################################
+# 3. Set mysql_root_password fact
+#######################################
+- name: Set mysql_root_password fact
+  ansible.builtin.set_fact:
+    mysql_root_password: >-
+      {{
+        (mysql_secret.resources[0].data.MYSQL_ROOT_PASSWORD | b64decode)
+        if mysql_secret.resources | length > 0
+        else generated_mysql_password.stdout
+      }}
+
+#######################################
+# 4. Create / ensure MySQL Secret
+#######################################
+- name: Create MySQL secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "mysql-secret-{{ ansible_operator_meta.name }}"
+        namespace: "{{ ansible_operator_meta.namespace }}"
+      type: Opaque
+      stringData:
+        MYSQL_ROOT_PASSWORD: "{{ mysql_root_password }}"
+
+#######################################
+# 5. ConfigMap for mysqld-exporter (only if enabled)
+#######################################
+- name: Create mysqld exporter config (only if metrics enabled)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "mysqld-exporter-cnf-{{ ansible_operator_meta.name }}"
+        namespace: "{{ ansible_operator_meta.namespace }}"
+      data:
+        my.cnf: |
+          [client]
+          user=root
+          password={{ mysql_root_password }}
+          host=127.0.0.1
+          port=3306
+  when: enabled_metrics
+
+#######################################
+# 6. Service without metrics
+#######################################
+- name: Create MySQL Service (no metrics)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: "mysql-{{ ansible_operator_meta.name }}"
+        namespace: "{{ ansible_operator_meta.namespace }}"
+      spec:
+        type: NodePort
+        selector:
+          app: mysql
+          instance: "{{ ansible_operator_meta.name }}"
+        ports:
+          - name: mysql
+            port: 3306
+            targetPort: 3306
+  when: not enabled_metrics
+
+#######################################
+# 6b. Service with metrics
+#######################################
+- name: Create MySQL Service (with metrics)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: "mysql-{{ ansible_operator_meta.name }}"
+        namespace: "{{ ansible_operator_meta.namespace }}"
+      spec:
+        type: NodePort
+        selector:
+          app: mysql
+          instance: "{{ ansible_operator_meta.name }}"
+        ports:
+          - name: mysql
+            port: 3306
+            targetPort: 3306
+          - name: metrics
+            port: 9104
+            targetPort: 9104
+  when: enabled_metrics
+
+#######################################
+# 7. StatefulSet without exporter
+#######################################
+- name: Create MySQL StatefulSet (no exporter)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: "mysql-{{ ansible_operator_meta.name }}"
+        namespace: "{{ ansible_operator_meta.namespace }}"
+      spec:
+        serviceName: "mysql-{{ ansible_operator_meta.name }}"
+        replicas: 1
+        selector:
+          matchLabels:
+            app: mysql
+            instance: "{{ ansible_operator_meta.name }}"
+        template:
+          metadata:
+            labels:
+              app: mysql
+              instance: "{{ ansible_operator_meta.name }}"
+          spec:
+            containers:
+              - name: mysql
+                image: mysql:8.0
+                env:
+                  - name: MYSQL_ROOT_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: "mysql-secret-{{ ansible_operator_meta.name }}"
+                        key: MYSQL_ROOT_PASSWORD
+                ports:
+                  - containerPort: 3306
+                volumeMounts:
+                  - name: data
+                    mountPath: /var/lib/mysql
+        volumeClaimTemplates:
+          - metadata:
+              name: data
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 5Gi
+  when: not enabled_metrics
+
+#######################################
+# 7b. StatefulSet with exporter
+#######################################
+- name: Create MySQL StatefulSet (with exporter)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: "mysql-{{ ansible_operator_meta.name }}"
+        namespace: "{{ ansible_operator_meta.namespace }}"
+      spec:
+        serviceName: "mysql-{{ ansible_operator_meta.name }}"
+        replicas: 1
+        selector:
+          matchLabels:
+            app: mysql
+            instance: "{{ ansible_operator_meta.name }}"
+        template:
+          metadata:
+            labels:
+              app: mysql
+              instance: "{{ ansible_operator_meta.name }}"
+          spec:
+            containers:
+              - name: mysql
+                image: mysql:8.0
+                env:
+                  - name: MYSQL_ROOT_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: "mysql-secret-{{ ansible_operator_meta.name }}"
+                        key: MYSQL_ROOT_PASSWORD
+                ports:
+                  - containerPort: 3306
+                volumeMounts:
+                  - name: data
+                    mountPath: /var/lib/mysql
+
+              - name: mysqld-exporter
+                image: prom/mysqld-exporter:latest
+                args:
+                  - "--config.my-cnf=/etc/my.cnf"
+                ports:
+                  - containerPort: 9104
+                volumeMounts:
+                  - name: mysqld-exporter-config
+                    mountPath: /etc/my.cnf
+                    subPath: my.cnf
+                    readOnly: true
+
+            volumes:
+              - name: mysqld-exporter-config
+                configMap:
+                  name: "mysqld-exporter-cnf-{{ ansible_operator_meta.name }}"
+
+        volumeClaimTemplates:
+          - metadata:
+              name: data
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 5Gi
+  when: enabled_metrics
+
+#######################################
+# 8. Status → Ready
+#######################################
+- name: Mark MySQLService as Ready
+  operator_sdk.util.k8s_status:
+    api_version: database.mycompany.org/v1alpha1
+    kind: MySQLService
+    name: "{{ ansible_operator_meta.name }}"
+    namespace: "{{ ansible_operator_meta.namespace }}"
+    status:
+      conditions:
+        - type: Ready
+          status: "True"
+          reason: MySQLCreated
+          message: "MySQL database is ready (metrics={{ enabled_metrics }})"
+        - type: Running
+          status: "False"
+          reason: Completed
+          message: Reconciliation completed

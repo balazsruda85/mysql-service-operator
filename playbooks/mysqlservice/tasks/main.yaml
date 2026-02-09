@@ -1,0 +1,2 @@
+- name: Import database tasks
+  ansible.builtin.import_tasks: database.yml

@@ -1,0 +1,4 @@
+- version: v1alpha1
+  group: database.mycompany.org
+  kind: MySQLService
+  playbook: playbooks/mysqlservice.yml
