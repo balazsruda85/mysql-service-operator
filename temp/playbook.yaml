@@ -1,0 +1,71 @@
+- name: Read Prometheus config from ConfigMap, modify, write back
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    cm_namespace: "grafana-system"
+    cm_name: "prometheus-config"
+    cm_key: "prometheus.yml"
+
+    job_name_to_add: "mysql-app-01-mysql-1"
+    target_to_add: "mysql-mysql-1.app-01.svc:9104"
+
+  tasks:
+    - name: Read ConfigMap
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ cm_name }}"
+        namespace: "{{ cm_namespace }}"
+      register: cm
+
+    - name: Extract prometheus.yml from ConfigMap
+      ansible.builtin.set_fact:
+        prom_text: "{{ cm.resources[0].data[cm_key] | default('') }}"
+
+    - name: Parse YAML (ConfigMap data -> object)
+      ansible.builtin.set_fact:
+        prom: "{{ prom_text | from_yaml }}"
+
+    - name: Ensure scrape_configs exists
+      ansible.builtin.set_fact:
+        prom: "{{ prom | combine({'scrape_configs': (prom.scrape_configs | default([]))}, recursive=True) }}"
+
+    - name: Build new job dict
+      ansible.builtin.set_fact:
+        new_job:
+          job_name: "{{ job_name_to_add }}"
+          metrics_path: "/metrics"
+          static_configs:
+            - targets:
+                - "{{ target_to_add }}"
+
+    - name: Check if job already exists
+      ansible.builtin.set_fact:
+        job_exists: "{{ (prom.scrape_configs | selectattr('job_name','equalto', job_name_to_add) | list | length) > 0 }}"
+
+    - name: Append job if missing
+      ansible.builtin.set_fact:
+        prom: "{{ prom | combine({'scrape_configs': prom.scrape_configs + [new_job]}, recursive=True) }}"
+      when: not job_exists
+
+    - name: Render YAML back to string
+      ansible.builtin.set_fact:
+        prom_text_new: "{{ prom | to_yaml }}"
+
+    - name: Build data dict for patch (IMPORTANT)
+      ansible.builtin.set_fact:
+        cm_data_patch: "{{ { cm_key: prom_text_new } }}"
+
+    - name: Patch ConfigMap only if changed
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ cm_name }}"
+            namespace: "{{ cm_namespace }}"
+          data: "{{ cm_data_patch }}"
+      when: prom_text_new != prom_text

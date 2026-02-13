@@ -1,0 +1,7 @@
+apiVersion: database.mycompany.org/v1alpha1
+kind: MySQLService
+metadata:
+  name: mysql-1
+  namespace: app-01
+spec:
+  enabledMetrics: true
