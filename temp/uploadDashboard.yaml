@@ -1,0 +1,103 @@
+- name: Import Grafana dashboard with host baked in and GET UI URL
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    grafana_url: "http://localhost:44819"
+    grafana_api_token: "{{ lookup('env','GRAFANA_API_TOKEN') }}"
+    dashboard_src: "./mysql-overview.json"
+    mysql_host: "mysql-db2.app-01.svc:9104"
+
+  tasks:
+    - name: Read dashboard JSON template
+      ansible.builtin.slurp:
+        src: "{{ dashboard_src }}"
+      register: dash_raw
+
+    - name: Replace placeholder __HOSTNAME__ -> mysql_host
+      ansible.builtin.set_fact:
+        dash_json_text: >-
+          {{
+            (dash_raw.content | b64decode)
+            | regex_replace('__HOSTNAME__', mysql_host)
+          }}
+
+    - name: Parse dashboard JSON
+      ansible.builtin.set_fact:
+        dash_obj: "{{ dash_json_text | from_json }}"
+
+    - name: Normalize dashboard for Grafana import (new dashboard)
+      ansible.builtin.set_fact:
+        dash_obj: >-
+          {{
+            dash_obj
+            | combine(
+                {
+                  'id': None,
+                  'uid': None,
+                  'title': dash_obj.title | default('MySQL Overview')
+                },
+                recursive=True
+              )
+          }}
+
+    - name: Wrap dashboard for Grafana API
+      ansible.builtin.set_fact:
+        grafana_payload:
+          dashboard: "{{ dash_obj }}"
+          overwrite: true
+
+    - name: Import dashboard to Grafana
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/dashboards/db"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ grafana_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: "{{ grafana_payload }}"
+        status_code: [200]
+        return_content: true
+      register: import_result
+
+    - name: Store import response
+      ansible.builtin.set_fact:
+        grafana_import: "{{ import_result.json }}"
+
+    - name: Persist import response to file
+      ansible.builtin.copy:
+        dest: "./grafana-import-result.json"
+        content: "{{ grafana_import | to_nice_json }}\n"
+
+    - name: Show import result
+      ansible.builtin.debug:
+        var: grafana_import
+
+    #
+    # 👉 ITT JÖN AMIT KÉRTÉL: GET A KONKRÉT DASHBOARD URL-RE
+    #
+    - name: Build full dashboard URL
+      ansible.builtin.set_fact:
+        dashboard_full_url: "{{ grafana_url }}{{ grafana_import.url }}"
+      when: grafana_import.status == "success"
+
+    - name: GET dashboard URL (UI check)
+      ansible.builtin.uri:
+        url: "{{ dashboard_full_url }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_api_token }}"
+          Accept: "text/html"
+        status_code: [200]
+        return_content: true
+      register: dashboard_get
+      when: grafana_import.status == "success"
+
+    - name: Show dashboard GET result
+      ansible.builtin.debug:
+        msg:
+          - "Dashboard URL: {{ dashboard_full_url }}"
+          - "HTTP status: {{ dashboard_get.status }}"
+          - "HTML snippet:"
+          - "{{ dashboard_get.content[:300] }}"
+      when: grafana_import.status == "success"

@@ -1,0 +1,59 @@
+---
+- name: Check if Grafana dashboard exists by title
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    grafana_url: "http://localhost:44819"
+    # Dashboard title to check (exact match)
+    ansible_operator_meta:
+      name: "Segszelep"
+
+    # Prefer: service account token (store in vault or env)
+    grafana_api_token: "{{ lookup('env', 'GRAFANA_API_TOKEN') }}"
+
+    # If true, fail the play when dashboard does not exist
+    fail_if_missing: false
+
+  tasks:
+    - name: Validate token is provided
+      ansible.builtin.assert:
+        that:
+          - grafana_api_token is defined
+          - grafana_api_token | length > 0
+        fail_msg: "GRAFANA_API_TOKEN is missing. Provide it via env or Ansible Vault."
+
+    - name: Search dashboards by query (Grafana API)
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/search?type=dash-db&query={{ ansible_operator_meta.name | urlencode }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_api_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true   # set false only if you really must (self-signed etc.)
+      register: grafana_search
+
+    - name: Determine exact title match
+      ansible.builtin.set_fact:
+        dashboard_exists: >-
+          {{
+            (grafana_search.json | default([]))
+            | selectattr('title', 'equalto', ansible_operator_meta.name)
+            | list
+            | length > 0
+          }}
+
+    - name: Print result
+      ansible.builtin.debug:
+        msg:
+          - "Dashboard title: {{ ansible_operator_meta.name }}"
+          - "Exists: {{ dashboard_exists }}"
+
+    - name: Fail if dashboard is missing (optional)
+      ansible.builtin.fail:
+        msg: "Dashboard '{{ ansible_operator_meta.name }}' does NOT exist in Grafana."
+      when:
+        - fail_if_missing | bool
+        - not dashboard_exists
